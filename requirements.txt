@@ -1,4 +1,233 @@
-flask==3.1.2
-twilio==8.11.0
-google-generativeai==0.3.2
-gunicorn==21.2.0
+import os
+from flask import Flask, request, Response
+from twilio.twiml.voice_response import VoiceResponse, Gather
+import google.generativeai as genai
+import logging
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+# Initialize Flask
+app = Flask(__name__)
+# Configure Gemini AI
+try:
+    gemini_key = os.getenv('GEMINI_API_KEY')
+    if gemini_key:
+        genai.configure(api_key=gemini_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        logger.info("Gemini AI configured successfully")
+    else:
+        logger.warning("GEMINI_API_KEY not set - AI features will be limited")
+        model = None
+except Exception as e:
+    logger.error(f"Error configuring Gemini: {e}")
+    model = None
+# Restaurant Menu
+MENU = {
+    'pizzas': [
+        {'name': 'Pepperoni Pizza', 'price': 14.99},
+        {'name': 'Margherita Pizza', 'price': 12.99},
+        {'name': 'BBQ Chicken Pizza', 'price': 15.99},
+        {'name': 'Veggie Supreme Pizza', 'price': 13.99}
+    ],
+    'sides': [
+        {'name': 'Garlic Bread', 'price': 5.99},
+        {'name': 'Caesar Salad', 'price': 8.99},
+        {'name': 'Chicken Wings', 'price': 9.99}
+    ],
+    'drinks': [
+        {'name': 'Coca Cola', 'price': 2.99},
+        {'name': 'Sprite', 'price': 2.99},
+        {'name': 'Water', 'price': 1.99}
+    ]
+}
+# Store conversation context (in production, use Redis or database)
+conversations = {}
+def get_menu_text():
+    """Generate menu text for AI."""
+    menu_text = "MENU:\n"
+    for category, items in MENU.items():
+        menu_text += f"\n{category.upper()}:\n"
+        for item in items:
+            menu_text += f"- {item['name']}: ${item['price']}\n"
+    return menu_text
+def get_ai_response(user_input, call_sid):
+    """Get response from Gemini AI."""
+    try:
+        # Check if model is available
+        if not model:
+            return "I can help you with our menu. We have pepperoni pizza for $14.99, margherita for $12.99, and BBQ chicken for $15.99. What would you like?"
+        
+        # Get or create conversation history
+        if call_sid not in conversations:
+            conversations[call_sid] = []
+        
+        # Build context
+        system_prompt = f"""You are a friendly AI assistant for Manoj's Bistro restaurant.
+Your job is to help customers order food over the phone.
+{get_menu_text()}
+Guidelines:
+- Be warm, friendly, and conversational
+- Help customers choose items from the menu
+- Confirm orders clearly
+- Keep responses SHORT (1-2 sentences max)
+- If they ask about the menu, mention 2-3 popular items
+- When they order, confirm the item and price
+- Ask if they want anything else
+Current conversation:
+{chr(10).join([f"{msg['role']}: {msg['content']}" for msg in conversations[call_sid][-4:]])}
+"""
+        
+        # Get AI response
+        full_prompt = f"{system_prompt}\n\nCustomer: {user_input}\nAssistant:"
+        response = model.generate_content(full_prompt)
+        ai_text = response.text.strip()
+        
+        # Store in conversation history
+        conversations[call_sid].append({'role': 'user', 'content': user_input})
+        conversations[call_sid].append({'role': 'assistant', 'content': ai_text})
+        
+        logger.info(f"User: {user_input} | AI: {ai_text}")
+        return ai_text
+    
+    except Exception as e:
+        logger.error(f"AI Error: {e}")
+        return "I'm sorry, I didn't catch that. Could you repeat?"
+@app.route('/voice', methods=['POST', 'GET'])
+def voice():
+    """Handle incoming call."""
+    try:
+        call_sid = request.values.get('CallSid', 'unknown')
+        logger.info(f"Incoming call: {call_sid}")
+        
+        response = VoiceResponse()
+        
+        # Welcome message
+        response.say(
+            "Welcome to Manoj's Bistro! I'm your AI assistant.",
+            voice='Polly.Joanna'
+        )
+        
+        # Start gathering input
+        gather = Gather(
+            input='speech',
+            action='/process',
+            method='POST',
+            speechTimeout='auto',
+            language='en-US'
+        )
+        gather.say(
+            "How can I help you today? You can ask about our menu or place an order.",
+            voice='Polly.Joanna'
+        )
+        response.append(gather)
+        
+        # Fallback if no input
+        response.say("I didn't hear anything. Goodbye!", voice='Polly.Joanna')
+        
+        return Response(str(response), mimetype='text/xml')
+    
+    except Exception as e:
+        logger.error(f"Error in voice: {e}")
+        response = VoiceResponse()
+        response.say("Sorry, technical error. Please call back.")
+        return Response(str(response), mimetype='text/xml')
+@app.route('/process', methods=['POST'])
+def process():
+    """Process speech input and respond."""
+    try:
+        call_sid = request.values.get('CallSid', 'unknown')
+        user_speech = request.values.get('SpeechResult', '').strip()
+        
+        if not user_speech:
+            user_speech = "I didn't say anything"
+        
+        logger.info(f"Call {call_sid}: User said: {user_speech}")
+        
+        # Get AI response
+        ai_response = get_ai_response(user_speech, call_sid)
+        
+        # Create TwiML response
+        response = VoiceResponse()
+        
+        # Check if conversation should end
+        end_keywords = ['goodbye', 'bye', 'thank you', 'that\'s all', 'nothing else']
+        should_end = any(keyword in user_speech.lower() for keyword in end_keywords)
+        
+        if should_end:
+            response.say(ai_response, voice='Polly.Joanna')
+            response.say("Thank you for calling Manoj's Bistro! Goodbye!", voice='Polly.Joanna')
+            response.hangup()
+        else:
+            # Continue conversation
+            gather = Gather(
+                input='speech',
+                action='/process',
+                method='POST',
+                speechTimeout='auto',
+                language='en-US'
+            )
+            gather.say(ai_response, voice='Polly.Joanna')
+            response.append(gather)
+            
+            # Fallback
+            response.say("Are you still there?", voice='Polly.Joanna')
+            response.redirect('/process')
+        
+        return Response(str(response), mimetype='text/xml')
+    
+    except Exception as e:
+        logger.error(f"Error in process: {e}")
+        response = VoiceResponse()
+        response.say("Sorry, I had trouble understanding. Could you try again?")
+        response.redirect('/process')
+        return Response(str(response), mimetype='text/xml')
+@app.route('/status', methods=['POST'])
+def status():
+    """Handle call status updates."""
+    call_sid = request.values.get('CallSid')
+    call_status = request.values.get('CallStatus')
+    logger.info(f"Call {call_sid} status: {call_status}")
+    
+    # Clean up conversation when call ends
+    if call_status in ['completed', 'failed', 'busy', 'no-answer']:
+        if call_sid in conversations:
+            del conversations[call_sid]
+    
+    return '', 200
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint."""
+    return {
+        'status': 'ok',
+        'active_calls': len(conversations),
+        'gemini_configured': bool(os.getenv('GEMINI_API_KEY'))
+    }, 200
+@app.route('/', methods=['GET'])
+def home():
+    """Home page."""
+    return """
+    <html>
+    <head><title>Manoj's Bistro AI Phone System</title></head>
+    <body style="font-family: Arial; padding: 40px; max-width: 800px; margin: 0 auto;">
+        <h1>🍕 Manoj's Bistro AI Phone System</h1>
+        <p><strong>Status:</strong> ✅ Running</p>
+        <p><strong>Phone Number:</strong> +18773525475</p>
+        <p><strong>Active Calls:</strong> {}</p>
+        <h2>How It Works:</h2>
+        <ol>
+            <li>Call the phone number</li>
+            <li>Talk to the AI assistant</li>
+            <li>Ask about the menu or place an order</li>
+            <li>The AI will help you complete your order</li>
+        </ol>
+        <h2>Menu:</h2>
+        <pre>{}</pre>
+    </body>
+    </html>
+    """.format(len(conversations), get_menu_text()), 200
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 5000))
+    logger.info("=" * 60)
+    logger.info(f"🚀 Starting Manoj's Bistro AI Phone System on port {port}")
+    logger.info("=" * 60)
+    app.run(host='0.0.0.0', port=port, debug=False)
